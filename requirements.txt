@@ -6,3 +6,9 @@ accelerate
 sentencepiece
 safetensors
 huggingface_hub
+datasets
+trl
+peft
+wandb
+bitsandbytes
+scikit-learn
