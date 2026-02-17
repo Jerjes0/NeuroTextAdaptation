@@ -4,18 +4,18 @@ import json
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any
 
 import torch
 import wandb
 from datasets import load_dataset, load_from_disk
-from peft import PeftModel
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from utils import add_nearest_context
 from utils import ensure_dirs
 from utils import explode_qa_pairs_with_prompt
 from utils import get_required_env
+from utils import get_selected_split
 from utils import load_prompt_template
+from utils import load_prediction_model
+from utils import normalize_text
 from utils import setup_logging
 from utils import split_pmids
 
@@ -29,14 +29,17 @@ LOAD_FROM_HF = False
 
 # "zero_shot" uses ZERO_SHOT_MODEL_ID.
 # "finetuned" uses FINETUNED_MODEL_PATH (adapter or full model depending on FINETUNED_IS_ADAPTER).
-MODEL_MODE = "zero_shot"  # "zero_shot" | "finetuned"
+MODEL_MODE = "finetuned"  # "zero_shot" | "finetuned"
+
+WITH_CONTEXT = False
+
 ZERO_SHOT_MODEL_ID = "HuggingFaceTB/SmolLM2-1.7B-Instruct"
-FINETUNED_MODEL_PATH = "your-username/your-finetuned-model-or-adapter"
+FINETUNED_MODEL_PATH = "Jerjes/smolllm2-pubmed-qa-noctx-20260217-152143"
 FINETUNED_IS_ADAPTER = True
 
 RANDOM_SEED = 42
 SPLIT_RATIOS = (0.70, 0.15, 0.15)
-MAX_PMIDS_DEFAULT = 10000
+MAX_PMIDS_DEFAULT = -1 # all of it
 MAX_PMIDS = None
 
 PREDICT_SPLIT = "test"  # "train" | "val" | "test"
@@ -53,9 +56,12 @@ LOG_EVERY = 100
 
 WANDB_REQUIRED = True
 WANDB_PROJECT = "neurotextadaptation-predict"
-PROMPT_PATH = Path("src/prompts/qa_context_prompt.txt")
 
-RUN_NAME = f"predict-{MODEL_MODE}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+PROMPT_WITH_CONTEXT_PATH = Path("src/prompts/qa_context_prompt.txt")
+PROMPT_NO_CONTEXT_PATH = Path("src/prompts/qa_no_context_prompt.txt")
+
+CONTEXT_TAG = "withctx" if WITH_CONTEXT else "noctx"
+RUN_NAME = f"predict-{MODEL_MODE}-{CONTEXT_TAG}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
 OUTPUT_ROOT = Path("outputs")
 OUTPUT_DIR = OUTPUT_ROOT / RUN_NAME
 LOG_PATH = OUTPUT_DIR / "predict.log"
@@ -75,71 +81,6 @@ def log_pipeline_event(log, stage: str, stage_idx: int, **metrics: float) -> Non
         wandb.run.summary["pipeline/last_stage"] = stage
 
 
-def get_selected_split(raw_dataset, train_pmids: set[int], val_pmids: set[int], test_pmids: set[int]):
-    if PREDICT_SPLIT == "train":
-        return raw_dataset.filter(lambda x: int(x["pmid"]) in train_pmids, desc="Filtering train split")
-    if PREDICT_SPLIT == "val":
-        return raw_dataset.filter(lambda x: int(x["pmid"]) in val_pmids, desc="Filtering val split")
-    if PREDICT_SPLIT == "test":
-        return raw_dataset.filter(lambda x: int(x["pmid"]) in test_pmids, desc="Filtering test split")
-    raise ValueError("PREDICT_SPLIT must be one of: train, val, test")
-
-
-def load_prediction_model(hf_token: str):
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif torch.backends.mps.is_available():
-        device = torch.device("mps")
-    else:
-        device = torch.device("cpu")
-
-    tokenizer_model_id = ZERO_SHOT_MODEL_ID if MODEL_MODE == "finetuned" else ZERO_SHOT_MODEL_ID
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_model_id, token=hf_token)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "right"
-
-    use_bf16 = bool(device.type == "cuda" and torch.cuda.is_bf16_supported())
-    if device.type == "cpu":
-        dtype = torch.float32
-    else:
-        dtype = torch.bfloat16 if use_bf16 else torch.float16
-
-    use_4bit_effective = bool(USE_4BIT and device.type == "cuda")
-    model_kwargs: dict[str, Any] = {"torch_dtype": dtype}
-    if use_4bit_effective:
-        model_kwargs["quantization_config"] = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=dtype,
-        )
-
-    if MODEL_MODE == "zero_shot":
-        model = AutoModelForCausalLM.from_pretrained(ZERO_SHOT_MODEL_ID, token=hf_token, **model_kwargs)
-        if not use_4bit_effective:
-            model.to(device)
-        return model, tokenizer, use_bf16, device, use_4bit_effective
-
-    if MODEL_MODE == "finetuned":
-        if FINETUNED_IS_ADAPTER:
-            base_model = AutoModelForCausalLM.from_pretrained(ZERO_SHOT_MODEL_ID, token=hf_token, **model_kwargs)
-            model = PeftModel.from_pretrained(base_model, FINETUNED_MODEL_PATH, token=hf_token)
-            if not use_4bit_effective:
-                model.to(device)
-            return model, tokenizer, use_bf16, device, use_4bit_effective
-        model = AutoModelForCausalLM.from_pretrained(FINETUNED_MODEL_PATH, token=hf_token, **model_kwargs)
-        if not use_4bit_effective:
-            model.to(device)
-        return model, tokenizer, use_bf16, device, use_4bit_effective
-
-    raise ValueError("MODEL_MODE must be 'zero_shot' or 'finetuned'")
-
-
-def normalize_text(text: str) -> str:
-    return " ".join(str(text).strip().lower().split())
-
-
 def main() -> None:
     global MAX_PMIDS
 
@@ -154,7 +95,8 @@ def main() -> None:
 
     ensure_dirs(OUTPUT_DIR)
     log = setup_logging(LOG_PATH, logger_name="pubmed-predict")
-    prompt_template = load_prompt_template(PROMPT_PATH)
+    prompt_path = PROMPT_WITH_CONTEXT_PATH if WITH_CONTEXT else PROMPT_NO_CONTEXT_PATH
+    prompt_template = load_prompt_template(prompt_path, require_context=WITH_CONTEXT)
 
     hf_token = get_required_env("HF_TOKEN")
     if WANDB_REQUIRED:
@@ -168,6 +110,8 @@ def main() -> None:
         "finetuned_model_path": FINETUNED_MODEL_PATH,
         "finetuned_is_adapter": FINETUNED_IS_ADAPTER,
         "predict_split": PREDICT_SPLIT,
+        "with_context": WITH_CONTEXT,
+        "prompt_path": str(prompt_path),
         "random_seed": RANDOM_SEED,
         "split_ratios": {"train": SPLIT_RATIOS[0], "val": SPLIT_RATIOS[1], "test": SPLIT_RATIOS[2]},
         "max_pmids_default": MAX_PMIDS_DEFAULT,
@@ -236,7 +180,13 @@ def main() -> None:
     )
 
     t0 = time.perf_counter()
-    selected_raw = get_selected_split(raw_dataset, train_pmids, val_pmids, test_pmids)
+    selected_raw = get_selected_split(
+        raw_dataset=raw_dataset,
+        predict_split=PREDICT_SPLIT,
+        train_pmids=train_pmids,
+        val_pmids=val_pmids,
+        test_pmids=test_pmids,
+    )
     stage_idx += 1
     log_pipeline_event(
         log,
@@ -249,17 +199,27 @@ def main() -> None:
     # ------------------------------------------------------------
     # Build retrieval context and prediction examples
     # ------------------------------------------------------------
-    t0 = time.perf_counter()
-    selected_raw = add_nearest_context(selected_raw, top_k=NUM_CONTEXT_PAPERS, log=log)
-    stage_idx += 1
-    log_pipeline_event(
-        log,
-        "retrieval_context_ready",
-        stage_idx,
-        context_k=float(NUM_CONTEXT_PAPERS),
-        rows_with_context=float(len(selected_raw)),
-        retrieval_seconds=round(time.perf_counter() - t0, 3),
-    )
+    if WITH_CONTEXT:
+        t0 = time.perf_counter()
+        selected_raw = add_nearest_context(selected_raw, top_k=NUM_CONTEXT_PAPERS, log=log)
+        stage_idx += 1
+        log_pipeline_event(
+            log,
+            "retrieval_context_ready",
+            stage_idx,
+            context_k=float(NUM_CONTEXT_PAPERS),
+            rows_with_context=float(len(selected_raw)),
+            retrieval_seconds=round(time.perf_counter() - t0, 3),
+        )
+    else:
+        stage_idx += 1
+        log_pipeline_event(
+            log,
+            "retrieval_context_skipped",
+            stage_idx,
+            with_context=0.0,
+            rows=float(len(selected_raw)),
+        )
 
     t0 = time.perf_counter()
     predict_dataset = explode_qa_pairs_with_prompt(selected_raw, prompt_template=prompt_template)
@@ -277,7 +237,14 @@ def main() -> None:
     # ------------------------------------------------------------
     # Load model
     # ------------------------------------------------------------
-    model, tokenizer, use_bf16, infer_device, use_4bit_effective = load_prediction_model(hf_token=hf_token)
+    model, tokenizer, use_bf16, infer_device, use_4bit_effective = load_prediction_model(
+        hf_token=hf_token,
+        model_mode=MODEL_MODE,
+        zero_shot_model_id=ZERO_SHOT_MODEL_ID,
+        finetuned_model_path=FINETUNED_MODEL_PATH,
+        finetuned_is_adapter=FINETUNED_IS_ADAPTER,
+        use_4bit=USE_4BIT,
+    )
     model.eval()
     stage_idx += 1
     log_pipeline_event(

@@ -1,0 +1,6 @@
+You are a neuroscience research assistant.
+Answer the following question to the best of your abilities.
+Be concise, factual, and clear.
+
+Question:
+{question}
