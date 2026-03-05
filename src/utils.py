@@ -2,6 +2,8 @@ import logging
 import os
 import random
 import re
+import importlib
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -304,3 +306,136 @@ def load_prediction_model(
 
 def normalize_text(text: str) -> str:
     return " ".join(str(text).strip().lower().split())
+
+
+def load_hf_evaluate_module() -> Any:
+    script_dir = Path(__file__).resolve().parent
+    original_path = sys.path[:]
+    try:
+        sys.path = [p for p in sys.path if Path(p).resolve() != script_dir]
+        hf_evaluate = importlib.import_module("evaluate")
+    finally:
+        sys.path = original_path
+
+    if not hasattr(hf_evaluate, "load"):
+        raise RuntimeError(
+            "Imported module 'evaluate' does not expose load(). "
+            "Check for naming conflicts or reinstall with: pip install --upgrade evaluate"
+        )
+    return hf_evaluate
+
+
+def merge_prediction_csvs(
+    input_paths: dict[str, Path],
+    key_cols: tuple[str, str] = ("pmid", "question"),
+    answer_col: str = "answer",
+    prediction_col: str = "predicted_answer",
+):
+    import pandas as pd
+
+    required = set(key_cols) | {answer_col, prediction_col}
+    merged = None
+    model_names = list(input_paths.keys())
+    answer_cols: list[str] = []
+
+    for name, path in input_paths.items():
+        df = pd.read_csv(path)
+        missing = required - set(df.columns)
+        if missing:
+            raise ValueError(f"Missing columns in {path}: {sorted(missing)}")
+        assert not df.duplicated(list(key_cols)).any(), (
+            f"Duplicate keys found in {path} for {list(key_cols)}"
+        )
+
+        answer_name = f"{answer_col}_{name}"
+        pred_name = f"{prediction_col}_{name}"
+        answer_cols.append(answer_name)
+        reduced = df[list(key_cols) + [answer_col, prediction_col]].rename(
+            columns={answer_col: answer_name, prediction_col: pred_name}
+        )
+        merged = reduced if merged is None else merged.merge(reduced, on=list(key_cols), how="inner")
+
+    if merged is None or merged.empty:
+        raise ValueError("No common rows found across all inputs after merging on pmid/question.")
+
+    first_answer = answer_cols[0]
+    answer_match = merged[answer_cols].eq(merged[first_answer], axis=0).all(axis=1)
+    assert bool(answer_match.all()), "Ground-truth answer mismatch across inputs for shared rows."
+
+    pred_map = {f"{prediction_col}_{name}": name for name in model_names}
+    keep_cols = list(key_cols) + [first_answer] + list(pred_map.keys())
+    return merged[keep_cols].rename(columns={first_answer: answer_col, **pred_map}), model_names
+
+
+def compute_similarity_metrics_table(
+    merged_df,
+    model_names: list[str],
+    answer_col: str = "answer",
+    bertscore_model_type: str = "distilbert-base-uncased",
+    bertscore_batch_size: int = 16,
+    bertscore_lang: str = "en",
+    bertscore_device: str = "cpu",
+):
+    import pandas as pd
+    try:
+        from tqdm.auto import tqdm
+    except Exception:
+        def tqdm(x, **kwargs):  # type: ignore[no-redef]
+            return x
+
+    hf_evaluate = load_hf_evaluate_module()
+    bleu_metric = hf_evaluate.load("bleu")
+    rouge_metric = hf_evaluate.load("rouge")
+    bertscore_metric = hf_evaluate.load("bertscore")
+
+    references = merged_df[answer_col].fillna("").astype(str).tolist()
+    bleu_refs = [[r] for r in references]
+    rows: list[dict[str, float | str]] = []
+
+    for name in tqdm(model_names, desc="Scoring models", unit="model"):
+        predictions = merged_df[name].fillna("").astype(str).tolist()
+        bleu = float(bleu_metric.compute(predictions=predictions, references=bleu_refs)["bleu"])
+        rouge = rouge_metric.compute(predictions=predictions, references=references, use_stemmer=True)
+        bert = bertscore_metric.compute(
+            predictions=predictions,
+            references=references,
+            model_type=bertscore_model_type,
+            batch_size=bertscore_batch_size,
+            lang=bertscore_lang,
+            device=bertscore_device,
+        )
+
+        rows.append(
+            {
+                "model": name,
+                "bleu": bleu,
+                "rougeL": float(rouge["rougeL"]),
+                "bertscore_f1": float(np.mean(bert["f1"])),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def plot_metrics_bargrid(metrics_df, output_path: Path) -> None:
+    import matplotlib.pyplot as plt
+
+    metric_cols = [c for c in metrics_df.columns if c != "model"]
+    fig, axes = plt.subplots(1, len(metric_cols), figsize=(4.5 * len(metric_cols), 4), sharey=True)
+    if len(metric_cols) == 1:
+        axes = [axes]
+
+    for ax, metric in zip(axes, metric_cols):
+        values = metrics_df[metric].astype(float).tolist()
+        bars = ax.bar(metrics_df["model"], values)
+        ax.set_title(metric)
+        ax.set_ylim(0.0, 1.0)
+        ax.grid(axis="y", alpha=0.25)
+        ax.tick_params(axis="x", rotation=20)
+        for bar, value in zip(bars, values):
+            ax.text(bar.get_x() + bar.get_width() / 2, value + 0.01, f"{value:.3f}", ha="center", va="bottom")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)

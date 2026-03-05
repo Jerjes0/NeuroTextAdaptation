@@ -12,3 +12,10 @@ peft
 wandb
 bitsandbytes
 scikit-learn
+bert-score
+evaluate
+matplotlib
+absl-py
+nltk
+rouge-score
+sacrebleu
